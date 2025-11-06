@@ -746,7 +746,7 @@ void Application::SetListeningMode(ListeningMode mode)
     listening_mode_ = mode;
 
     SetDeviceState(kDeviceStateListening);
-    audio_service_.PlaySound(Lang::Sounds::OGG_TANDAY);
+    audio_service_.PlaySound(Lang::Sounds::OGG_BIBI);
     // audio_service_.PlaySound(Lang::Sounds::OGG_TANDAY);
     ESP_LOGI("SOUND", "WELCOME size=%u", (unsigned)Lang::Sounds::OGG_WELCOME.size());
     // ESP_LOGI("SOUND", "TANDAY  size=%u", (unsigned)Lang::Sounds::OGG_TANDAY.size());
