@@ -13,6 +13,7 @@
 
 #define AUDIO_CODEC_DMA_DESC_NUM 6
 #define AUDIO_CODEC_DMA_FRAME_NUM 240
+#define AUDIO_CODEC_DEFAULT_MIC_GAIN 30.0
 
 class AudioCodec {
 public:
@@ -20,9 +21,9 @@ public:
     virtual ~AudioCodec();
     
     virtual void SetOutputVolume(int volume);
-    virtual void SetInputGain(float gain);
     virtual void EnableInput(bool enable);
     virtual void EnableOutput(bool enable);
+    virtual bool SetOutputSampleRate(int sample_rate);
 
     virtual void OutputData(std::vector<int16_t>& data);
     virtual bool InputData(std::vector<int16_t>& data);
@@ -35,10 +36,9 @@ public:
     inline int input_channels() const { return input_channels_; }
     inline int output_channels() const { return output_channels_; }
     inline int output_volume() const { return output_volume_; }
-    inline float input_gain() const { return input_gain_; }
     inline bool input_enabled() const { return input_enabled_; }
     inline bool output_enabled() const { return output_enabled_; }
-
+    inline int original_output_sample_rate() const { return original_output_sample_rate_; }
 protected:
     i2s_chan_handle_t tx_handle_ = nullptr;
     i2s_chan_handle_t rx_handle_ = nullptr;
@@ -52,8 +52,8 @@ protected:
     int input_channels_ = 1;
     int output_channels_ = 1;
     int output_volume_ = 70;
-    float input_gain_ = 0.0;
-
+    int original_output_sample_rate_ = 0;
+    
     virtual int Read(int16_t* dest, int samples) = 0;
     virtual int Write(const int16_t* data, int samples) = 0;
 };

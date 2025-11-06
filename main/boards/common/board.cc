@@ -4,6 +4,7 @@
 #include "display/display.h"
 #include "display/oled_display.h"
 #include "assets/lang_config.h"
+#include "esp32_music.h"
 
 #include <esp_log.h>
 #include <esp_ota_ops.h>
@@ -13,13 +14,24 @@
 #define TAG "Board"
 
 Board::Board() {
+    music_ = nullptr; 
+
     Settings settings("board", true);
     uuid_ = settings.GetString("uuid");
     if (uuid_.empty()) {
         uuid_ = GenerateUuid();
         settings.SetString("uuid", uuid_);
     }
+      music_ = new Esp32Music();
     ESP_LOGI(TAG, "UUID=%s SKU=%s", uuid_.c_str(), BOARD_NAME);
+}
+
+Board::~Board() {
+    if (music_) {
+        delete music_;
+        music_ = nullptr;
+        ESP_LOGI(TAG, "Music player destroyed");
+    }
 }
 
 std::string Board::GenerateUuid() {
@@ -61,7 +73,9 @@ Display* Board::GetDisplay() {
 Camera* Board::GetCamera() {
     return nullptr;
 }
-
+Music* Board::GetMusic() {
+    return music_;
+}
 Led* Board::GetLed() {
     static NoLed led;
     return &led;
