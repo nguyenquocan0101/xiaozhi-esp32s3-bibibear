@@ -595,6 +595,7 @@ void Application::Start()
     if (protocol_started)
     {
         std::string message = std::string(Lang::Strings::VERSION) + ota.GetCurrentVersion();
+        // std::string message = std::string(Lang::Strings::VANSILVER_VERSION);
         display->ShowNotification(message.c_str());
         // display->SetChatMessage("system", "");
         // Play the success sound to indicate the device is ready
@@ -763,6 +764,12 @@ void Application::SetDeviceState(DeviceState state)
     auto previous_state = device_state_;
     device_state_ = state;
     ESP_LOGI(TAG, "STATE: %s", STATE_STRINGS[device_state_]);
+
+    if (strcmp(STATE_STRINGS[device_state_], "listening") == 0)
+    {
+        audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
 
     // Send the state change event
     DeviceStateEventManager::GetInstance().PostStateChangeEvent(previous_state, state);
@@ -1006,6 +1013,22 @@ void Application::SetAecMode(AecMode mode)
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
             protocol_->CloseAudioChannel();
         } });
+}
+// 新增：接收外部音频数据（如音乐播放）
+void Application::AddAudioData(AudioStreamPacket &&packet)
+{
+    auto codec = Board::GetInstance().GetAudioCodec();
+    if (device_state_ == kDeviceStateIdle && codec->output_enabled())
+    {
+        // packet.payload包含的是原始PCM数据（int16_t）
+        if (packet.payload.size() >= 2)
+        {
+            size_t num_samples = packet.payload.size() / sizeof(int16_t);
+            std::vector<int16_t> pcm_data(num_samples);
+            memcpy(pcm_data.data(), packet.payload.data(), packet.payload.size());
+            // FIXME: pcm_data is not played.
+        }
+    }
 }
 
 void Application::PlaySound(const std::string_view &sound)
