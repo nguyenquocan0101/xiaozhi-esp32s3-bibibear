@@ -598,7 +598,7 @@ void Application::Start()
         display->ShowNotification(message.c_str());
         // display->SetChatMessage("system", "");
         // Play the success sound to indicate the device is ready
-        audio_service_.PlaySound(Lang::Sounds::OGG_WELCOME);
+        audio_service_.PlaySound(Lang::Sounds::OGG_BIBI);
     }
 
     display->SetStatus(Lang::Strings::ACTIVATION);
@@ -746,9 +746,9 @@ void Application::SetListeningMode(ListeningMode mode)
     listening_mode_ = mode;
 
     SetDeviceState(kDeviceStateListening);
-    audio_service_.PlaySound(Lang::Sounds::OGG_BIBI);
+    audio_service_.PlaySound(Lang::Sounds::OGG_WELCOME);
     // audio_service_.PlaySound(Lang::Sounds::OGG_TANDAY);
-    ESP_LOGI("SOUND", "WELCOME size=%u", (unsigned)Lang::Sounds::OGG_WELCOME.size());
+    // ESP_LOGI("SOUND", "WELCOME size=%u", (unsigned)Lang::Sounds::OGG_WELCOME.size());
     // ESP_LOGI("SOUND", "TANDAY  size=%u", (unsigned)Lang::Sounds::OGG_TANDAY.size());
 }
 
