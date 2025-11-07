@@ -254,7 +254,7 @@ void Application::Alert(const char *status, const char *message, const char *emo
 {
     ESP_LOGW(TAG, "Alert [%s] %s: %s", emotion, status, message);
     auto display = Board::GetInstance().GetDisplay();
-    display->SetStatus(status);
+    // display->SetStatus(status);
     display->SetEmotion(emotion);
     display->SetChatMessage("system", message);
     if (!sound.empty())
@@ -525,7 +525,7 @@ void Application::Start()
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
                     Schedule([this, display, message = std::string(text->valuestring)]() {
-                        display->SetChatMessage("assistant", message.c_str());
+                        // display->SetChatMessage("assistant", message.c_str());
                     });
                 }
             }
@@ -534,7 +534,7 @@ void Application::Start()
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
                 Schedule([this, display, message = std::string(text->valuestring)]() {
-                    display->SetChatMessage("user", message.c_str());
+                    // display->SetChatMessage("user", message.c_str());
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
@@ -592,22 +592,18 @@ void Application::Start()
     SetDeviceState(kDeviceStateIdle);
 
     has_server_time_ = ota.HasServerTime();
-    // if (protocol_started) {
-    //     std::string message = std::string(Lang::Strings::VERSION) + ota.GetCurrentVersion();
-    //     display->ShowNotification(message.c_str());
-    //     display->SetChatMessage("system", "");
-    //     // Play the success sound to indicate the device is ready
-    //     audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
-    // }
     if (protocol_started)
     {
         std::string message = std::string(Lang::Strings::VERSION) + ota.GetCurrentVersion();
         // std::string message = std::string(Lang::Strings::VANSILVER_VERSION);
         display->ShowNotification(message.c_str());
-        display->SetChatMessage("system", "");
+        // display->SetChatMessage("system", "");
         // Play the success sound to indicate the device is ready
-        audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
+        audio_service_.PlaySound(Lang::Sounds::OGG_BIBI);
     }
+
+    display->SetStatus(Lang::Strings::ACTIVATION);
+    display->SetStatus("");
 }
 
 // Add a async task to MainLoop
@@ -749,7 +745,12 @@ void Application::AbortSpeaking(AbortReason reason)
 void Application::SetListeningMode(ListeningMode mode)
 {
     listening_mode_ = mode;
+
     SetDeviceState(kDeviceStateListening);
+    audio_service_.PlaySound(Lang::Sounds::OGG_WELCOME);
+    // audio_service_.PlaySound(Lang::Sounds::OGG_TANDAY);
+    // ESP_LOGI("SOUND", "WELCOME size=%u", (unsigned)Lang::Sounds::OGG_WELCOME.size());
+    // ESP_LOGI("SOUND", "TANDAY  size=%u", (unsigned)Lang::Sounds::OGG_TANDAY.size());
 }
 
 void Application::SetDeviceState(DeviceState state)
@@ -781,18 +782,18 @@ void Application::SetDeviceState(DeviceState state)
     {
     case kDeviceStateUnknown:
     case kDeviceStateIdle:
-        display->SetStatus(Lang::Strings::STANDBY);
+        // display->SetStatus(Lang::Strings::STANDBY);
         display->SetEmotion("neutral");
         audio_service_.EnableVoiceProcessing(false);
         audio_service_.EnableWakeWordDetection(true);
         break;
     case kDeviceStateConnecting:
-        display->SetStatus(Lang::Strings::CONNECTING);
+        // display->SetStatus(Lang::Strings::CONNECTING);
         display->SetEmotion("neutral");
         display->SetChatMessage("system", "");
         break;
     case kDeviceStateListening:
-        display->SetStatus(Lang::Strings::LISTENING);
+        // display->SetStatus(Lang::Strings::LISTENING);
         display->SetEmotion("neutral");
 
         // Make sure the audio processor is running
@@ -805,7 +806,7 @@ void Application::SetDeviceState(DeviceState state)
         }
         break;
     case kDeviceStateSpeaking:
-        display->SetStatus(Lang::Strings::SPEAKING);
+        // display->SetStatus(Lang::Strings::SPEAKING);
 
         if (listening_mode_ != kListeningModeRealtime)
         {
@@ -896,14 +897,40 @@ bool Application::UpgradeFirmware(Ota &ota, const std::string &url)
 
 void Application::WakeWordInvoke(const std::string &wake_word)
 {
+    if (!protocol_)
+    {
+        return;
+    }
+
     if (device_state_ == kDeviceStateIdle)
     {
-        ToggleChatState();
-        Schedule([this, wake_word]()
-                 {
-            if (protocol_) {
-                protocol_->SendWakeWordDetected(wake_word); 
-            } });
+        audio_service_.EncodeWakeWord();
+
+        if (!protocol_->IsAudioChannelOpened())
+        {
+            SetDeviceState(kDeviceStateConnecting);
+            if (!protocol_->OpenAudioChannel())
+            {
+                audio_service_.EnableWakeWordDetection(true);
+                return;
+            }
+        }
+
+        ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
+#if CONFIG_USE_AFE_WAKE_WORD || CONFIG_USE_CUSTOM_WAKE_WORD
+        // Encode and send the wake word data to the server
+        while (auto packet = audio_service_.PopWakeWordPacket())
+        {
+            protocol_->SendAudio(std::move(packet));
+        }
+        // Set the chat state to wake word detected
+        protocol_->SendWakeWordDetected(wake_word);
+        SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+#else
+        SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+        // Play the pop up sound to indicate the wake word is detected
+        audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+#endif
     }
     else if (device_state_ == kDeviceStateSpeaking)
     {
@@ -1000,92 +1027,6 @@ void Application::AddAudioData(AudioStreamPacket &&packet)
             std::vector<int16_t> pcm_data(num_samples);
             memcpy(pcm_data.data(), packet.payload.data(), packet.payload.size());
 
-            // 检查采样率是否匹配，如果不匹配则进行简单重采样
-            if (packet.sample_rate != codec->output_sample_rate())
-            {
-                // ESP_LOGI(TAG, "Resampling music audio from %d to %d Hz",
-                //         packet.sample_rate, codec->output_sample_rate());
-
-                // 验证采样率参数
-                if (packet.sample_rate <= 0 || codec->output_sample_rate() <= 0)
-                {
-                    ESP_LOGE(TAG, "Invalid sample rates: %d -> %d",
-                             packet.sample_rate, codec->output_sample_rate());
-                    return;
-                }
-
-                std::vector<int16_t> resampled;
-
-                if (packet.sample_rate > codec->output_sample_rate())
-                {
-                    ESP_LOGI(TAG, "音乐播放：将采样率从 %d Hz 切换到 %d Hz",
-                             codec->output_sample_rate(), packet.sample_rate);
-
-                    // 尝试动态切换采样率
-                    if (codec->SetOutputSampleRate(packet.sample_rate))
-                    {
-                        ESP_LOGI(TAG, "成功切换到音乐播放采样率: %d Hz", packet.sample_rate);
-                    }
-                    else
-                    {
-                        ESP_LOGW(TAG, "无法切换采样率，继续使用当前采样率: %d Hz", codec->output_sample_rate());
-                    }
-                }
-                else
-                {
-                    // 上采样：线性插值
-                    float upsample_ratio = codec->output_sample_rate() / static_cast<float>(packet.sample_rate);
-                    size_t expected_size = static_cast<size_t>(pcm_data.size() * upsample_ratio + 0.5f);
-                    resampled.reserve(expected_size);
-
-                    for (size_t i = 0; i < pcm_data.size(); ++i)
-                    {
-                        // 添加原始样本
-                        resampled.push_back(pcm_data[i]);
-
-                        // 计算需要插值的样本数
-                        int interpolation_count = static_cast<int>(upsample_ratio) - 1;
-                        if (interpolation_count > 0 && i + 1 < pcm_data.size())
-                        {
-                            int16_t current = pcm_data[i];
-                            int16_t next = pcm_data[i + 1];
-                            for (int j = 1; j <= interpolation_count; ++j)
-                            {
-                                float t = static_cast<float>(j) / (interpolation_count + 1);
-                                int16_t interpolated = static_cast<int16_t>(current + (next - current) * t);
-                                resampled.push_back(interpolated);
-                            }
-                        }
-                        else if (interpolation_count > 0)
-                        {
-                            // 最后一个样本，直接重复
-                            for (int j = 1; j <= interpolation_count; ++j)
-                            {
-                                resampled.push_back(pcm_data[i]);
-                            }
-                        }
-                    }
-
-                    ESP_LOGI(TAG, "Upsampled %d -> %d samples (ratio: %.2f)",
-                             pcm_data.size(), resampled.size(), upsample_ratio);
-                }
-
-                pcm_data = std::move(resampled);
-            }
-
-            // 确保音频输出已启用
-            if (!codec->output_enabled())
-            {
-                codec->EnableOutput(true);
-            }
-
-            // 发送PCM数据到音频编解码器
-            codec->OutputData(pcm_data);
-
-            audio_service_.UpdateOutputTimestamp();
-        }
-    }
-}
 void Application::PlaySound(const std::string_view &sound)
 {
     audio_service_.PlaySound(sound);

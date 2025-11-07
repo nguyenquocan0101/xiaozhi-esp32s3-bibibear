@@ -97,9 +97,8 @@ public:
     void SetEmotion(const char *emotion) override
     {
         last_emotion_ = (emotion && *emotion) ? emotion : "neutral";
-        // Cập nhật UI trái như cũ
-        SpiLcdDisplay::SetEmotion(last_emotion_.c_str());
-        // Mirror ngay
+        // Don't update the left UI here. Instead, just invoke the callback
+        // to schedule a synchronized update for BOTH eyes.
         if (on_emotion_change_)
             on_emotion_change_(last_emotion_);
     }
@@ -141,18 +140,17 @@ public:
 
         add_secondary_display();
 
-        // Đồng bộ NGAY khi đổi icon
-        display_left_->SetEmotionCallback([this](const std::string &)
-                                          {
-            need_resync_ = true;
-            Application::GetInstance().Schedule([this](){ this->instant_resync(); }); });
-        need_resync_ = true;
+        // Schedule a task to update both eyes simultaneously.
+        display_left_->SetEmotionCallback([this](const std::string &emotion)
+                                          { Application::GetInstance().Schedule([this, emotion]()
+                                                                                { this->update_emotions_task(emotion); }); });
 
         init_backlight();
         set_brightness(brightness_);
         init_buttons();
 
-        // Timer chỉ invalidate để GIF animate
+        // This timer's only purpose is to invalidate the right screen
+        // to keep GIF animations running smoothly.
         const esp_timer_create_args_t targs = {
             .callback = &MirrorTimerCb,
             .arg = this,
@@ -326,7 +324,7 @@ private:
             lv_display_set_default(old);
 
             // Sync lần đầu (không chờ event)
-            this->instant_resync();
+            this->update_emotions_task("neutral");
 
             lvgl_port_unlock(); });
     }
@@ -400,12 +398,9 @@ private:
         lv_obj_invalidate(img2_);
     }
 
-    // Đồng bộ ngay lập tức (không chờ timer), NO decoder
-    void instant_resync()
+    void sync_right_eye_unsafe()
     {
         if (!disp2_ || !img2_)
-            return;
-        if (!lvgl_port_lock(pdMS_TO_TICKS(20)))
             return;
 
         lv_obj_t *left_img = nullptr;
@@ -419,7 +414,7 @@ private:
             }
             else
             {
-                // src đã giống -> invalidate nhẹ cho đồng bộ khung
+                // src has not changed, just invalidate for GIF animation frame
                 lv_obj_clear_flag(img2_, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_invalidate(img2_);
             }
@@ -429,15 +424,28 @@ private:
             lv_obj_add_flag(img2_, LV_OBJ_FLAG_HIDDEN);
             last_left_src_ = nullptr;
         }
-
-        lvgl_port_unlock();
-        need_resync_ = false;
     }
 
-    //==================== Timer animate (fallback nhẹ) ====================
+    void update_emotions_task(const std::string &emotion)
+    {
+        if (!lvgl_port_lock(portMAX_DELAY))
+            return;
+
+        // 1. Update the left eye by calling the original base class method.
+        // This will update the image source and handle GIF animations.
+        display_left_->SpiLcdDisplay::SetEmotion(emotion.c_str());
+
+        // 2. Synchronize the right eye with the new state of the left eye.
+        sync_right_eye_unsafe();
+
+        lvgl_port_unlock();
+    }
+
+    //==================== Timer for GIF animation ====================
     static void MirrorTimerCb(void *arg)
     {
         auto *self = static_cast<WaveshareS3DualEyeLCD *>(arg);
+        // This task is very lightweight, just invalidating the object.
         Application::GetInstance().Schedule([self]()
                                             { self->mirror_step(); });
     }
@@ -450,24 +458,9 @@ private:
         if (!lvgl_port_lock(pdMS_TO_TICKS(5)))
             return;
 
-        // Nếu đang cần resync (vừa đổi icon), thử áp ngay (không decode)
-        if (need_resync_)
-        {
-            lv_obj_t *left_img = nullptr;
-            const void *src = nullptr;
-            if (fetch_left_image_src(&left_img, &src))
-            {
-                if (src != last_left_src_)
-                {
-                    apply_src_to_secondary_opt(src, left_img);
-                    last_left_src_ = src;
-                }
-            }
-            need_resync_ = false;
-        }
-
-        // Luôn invalidate để GIF tiếp tục animate mượt (không thay src)
+        // Always invalidate the right image to keep GIFs animating smoothly.
         lv_obj_invalidate(img2_);
+
         lvgl_port_unlock();
     }
 
@@ -547,7 +540,6 @@ private:
     // Cache & sync
     lv_obj_t *left_img_cached_ = nullptr;
     const void *last_left_src_ = nullptr;
-    volatile bool need_resync_ = false;
 
     // Kích thước icon hiện tại (màn phải)
     lv_coord_t last_w2_ = -1, last_h2_ = -1;
