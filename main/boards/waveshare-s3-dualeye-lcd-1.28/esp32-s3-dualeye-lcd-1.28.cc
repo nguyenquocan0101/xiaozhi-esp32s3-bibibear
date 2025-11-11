@@ -1,9 +1,6 @@
-// esp32-s3-dualeye-lcd-1.28.cc (FINAL v9.3 - Cách A, Smooth GIF + No-Decoder)
-// Dual round GC9A01 for Xiaozhi (LVGL v9.3, ESP-IDF v5.5)
-// - Giữ kiến trúc Cách A của bạn: đổi icon -> mirror ngay; timer chỉ invalidate cho GIF mượt
-// - Loại bỏ hoàn toàn lv_image_decoder_get_info (ngăn crash lodepng/memcmp)
-// - Kích thước ảnh phải lấy từ chính object ảnh trái (không decode) -> tránh khựng khi chuyển GIF
-// - swap_bytes=1 cho màn phải để đúng màu
+// esp32-s3-dualeye-lcd-1.28.cc (FINAL v9.3 - Cách A, Smooth GIF + No-Decoder + PowerSave 3 pha, FIX WDT)
+// - Không đụng logic hiển thị của bạn; chỉ sửa hàm reload_and_invalidate_both() an toàn (có lock, không lv_refr_now)
+// - Vòng lặp: Normal -> Sleep (icon ngủ, BL thấp, mirror chậm) -> ScreenOff (tắt panel/BL, dừng mirror, vẫn nghe) -> Wake (khôi phục) -> ...
 
 #include "wifi_board.h"
 #include "codecs/box_audio_codec.h"
@@ -36,6 +33,7 @@
 
 #include <string>
 #include <functional>
+#include <atomic>
 
 #define TAG "DualEyeLCD"
 
@@ -52,6 +50,9 @@
 #ifndef MIRROR_PERIOD_MS
 #define MIRROR_PERIOD_MS 60 // timer chỉ để GIF animate
 #endif
+
+#define MIRROR_PERIOD_MS_SLEEP 200 // animate chậm khi sleep
+#define SLEEP_BACKLIGHT_PERCENT 8  // backlight thấp khi sleep
 
 #define LEDC_MAX_DUTY 8191
 #define BACKLIGHT_MAX 100
@@ -97,12 +98,11 @@ public:
     void SetEmotion(const char *emotion) override
     {
         last_emotion_ = (emotion && *emotion) ? emotion : "neutral";
-        // Don't update the left UI here. Instead, just invoke the callback
-        // to schedule a synchronized update for BOTH eyes.
         if (on_emotion_change_)
             on_emotion_change_(last_emotion_);
     }
     void SetEmotionCallback(std::function<void(const std::string &)> cb) { on_emotion_change_ = std::move(cb); }
+    const std::string &LastEmotion() const { return last_emotion_; }
 
 private:
     std::string last_emotion_ = "neutral";
@@ -140,17 +140,20 @@ public:
 
         add_secondary_display();
 
-        // Schedule a task to update both eyes simultaneously.
+        // Đồng bộ 2 mắt khi đổi emotion
         display_left_->SetEmotionCallback([this](const std::string &emotion)
-                                          { Application::GetInstance().Schedule([this, emotion]()
-                                                                                { this->update_emotions_task(emotion); }); });
+                                          {
+            if (!sleeping_.load() && !screen_off_.load()) {
+                last_active_emotion_ = emotion;
+            }
+            Application::GetInstance().Schedule([this, emotion]()
+            { this->update_emotions_task(emotion); }); });
 
         init_backlight();
-        set_brightness(brightness_);
+        set_backlight(brightness_normal_, /*persist=*/true); // dùng độ sáng chuẩn
         init_buttons();
 
-        // This timer's only purpose is to invalidate the right screen
-        // to keep GIF animations running smoothly.
+        // Timer invalidate để GIF mượt cho màn phải
         const esp_timer_create_args_t targs = {
             .callback = &MirrorTimerCb,
             .arg = this,
@@ -159,7 +162,10 @@ public:
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&targs, &mirror_timer_));
-        ESP_ERROR_CHECK(esp_timer_start_periodic(mirror_timer_, MIRROR_PERIOD_MS * 1000));
+        start_mirror_timer(); // tốc độ thường
+
+        // PowerSave 3 pha (vòng lặp như yêu cầu)
+        init_power_save(); // (-1, 60, 290)
 
         ESP_LOGI(TAG, "Board init done");
     }
@@ -354,10 +360,8 @@ private:
         return true;
     }
 
-    // LẤY SIZE TỪ ẢNH TRÁI (không gọi decoder) -> không khựng khi chuyển GIF/PNG
     void apply_src_to_secondary_opt(const void *src, lv_obj_t *left_img)
     {
-        // Guard src cơ bản
         lv_image_src_t tp = lv_image_src_get_type(src);
         if (tp == LV_IMAGE_SRC_UNKNOWN)
         {
@@ -374,10 +378,8 @@ private:
             }
         }
 
-        // 1) set src (không reset nhiều lần)
         img_set_src(img2_, src);
 
-        // 2) size theo object trái (đang hiển thị), không decode
         lv_coord_t w = left_img ? lv_obj_get_width(left_img) : DISPLAY_WIDTH;
         lv_coord_t h = left_img ? lv_obj_get_height(left_img) : DISPLAY_HEIGHT;
         if (w <= 0 || h <= 0)
@@ -414,7 +416,6 @@ private:
             }
             else
             {
-                // src has not changed, just invalidate for GIF animation frame
                 lv_obj_clear_flag(img2_, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_invalidate(img2_);
             }
@@ -431,12 +432,11 @@ private:
         if (!lvgl_port_lock(portMAX_DELAY))
             return;
 
-        // 1. Update the left eye by calling the original base class method.
-        // This will update the image source and handle GIF animations.
         display_left_->SpiLcdDisplay::SetEmotion(emotion.c_str());
-
-        // 2. Synchronize the right eye with the new state of the left eye.
         sync_right_eye_unsafe();
+
+        if (!sleeping_.load() && !screen_off_.load())
+            last_active_emotion_ = emotion;
 
         lvgl_port_unlock();
     }
@@ -445,7 +445,6 @@ private:
     static void MirrorTimerCb(void *arg)
     {
         auto *self = static_cast<WaveshareS3DualEyeLCD *>(arg);
-        // This task is very lightweight, just invalidating the object.
         Application::GetInstance().Schedule([self]()
                                             { self->mirror_step(); });
     }
@@ -454,12 +453,63 @@ private:
     {
         if (!disp2_ || !img2_)
             return;
-
         if (!lvgl_port_lock(pdMS_TO_TICKS(5)))
             return;
-
-        // Always invalidate the right image to keep GIFs animating smoothly.
         lv_obj_invalidate(img2_);
+        lvgl_port_unlock();
+    }
+
+    void start_mirror_timer()
+    {
+        if (mirror_timer_ && !mirror_timer_started_)
+        {
+            ESP_ERROR_CHECK(esp_timer_start_periodic(mirror_timer_, MIRROR_PERIOD_MS * 1000));
+            mirror_timer_started_ = true;
+        }
+    }
+
+    void stop_mirror_timer()
+    {
+        if (mirror_timer_ && mirror_timer_started_)
+        {
+            ESP_ERROR_CHECK(esp_timer_stop(mirror_timer_));
+            mirror_timer_started_ = false;
+        }
+    }
+
+    void set_mirror_period_ms(uint32_t period_ms)
+    {
+        if (!mirror_timer_)
+            return;
+        if (mirror_timer_started_)
+            ESP_ERROR_CHECK(esp_timer_stop(mirror_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(mirror_timer_, period_ms * 1000));
+        mirror_timer_started_ = true;
+    }
+
+    // ======= SỬA LỖI WDT: hàm an toàn, luôn khóa khi đụng LVGL; không đổi default, không lv_refr_now =======
+    void reload_and_invalidate_both()
+    {
+        if (!lvgl_port_lock(pdMS_TO_TICKS(50)))
+            return;
+
+        // Trái: chỉ invalidate screen hiện tại
+        if (auto *left = lv_display_get_default())
+        {
+            if (auto *scr = lv_display_get_screen_active(left))
+            {
+                lv_obj_invalidate(scr);
+            }
+        }
+
+        // Phải: không đổi default, không screen_load lại ở đây
+        if (disp2_)
+        {
+            if (scr2_)
+                lv_obj_invalidate(scr2_);
+            if (img2_)
+                lv_obj_invalidate(img2_);
+        }
 
         lvgl_port_unlock();
     }
@@ -488,7 +538,8 @@ private:
         }
     }
 
-    void set_brightness(uint8_t light)
+    // set_backlight: persist=false dùng khi sleep/screen-off (KHÔNG ghi đè brightness_normal_)
+    void set_backlight(uint8_t light, bool persist)
     {
         if (light > BACKLIGHT_MAX)
             light = BACKLIGHT_MAX;
@@ -504,7 +555,77 @@ private:
             ledc_set_duty(bl_ch2_.speed_mode, bl_ch2_.channel, duty);
             ledc_update_duty(bl_ch2_.speed_mode, bl_ch2_.channel);
         }
-        brightness_ = light;
+        brightness_current_ = light;
+        if (persist)
+            brightness_normal_ = light;
+    }
+
+    // ================== PowerSave: helpers (gom gọn, không đụng màn hình) ==================
+    void enter_sleep()
+    {
+        sleeping_.store(true);
+        Application::GetInstance().Schedule([this]()
+                                            {
+            display_left_->SpiLcdDisplay::SetEmotion(sleeping_emotion_);
+            GetDisplay()->SetPowerSaveMode(true);
+            set_backlight(SLEEP_BACKLIGHT_PERCENT, /*persist=*/false);
+            set_mirror_period_ms(MIRROR_PERIOD_MS_SLEEP); });
+    }
+
+    void exit_sleep()
+    {
+        sleeping_.store(false);
+        screen_off_.store(false);
+        Application::GetInstance().Schedule([this]()
+                                            {
+            if (panel1_) esp_lcd_panel_disp_on_off(panel1_, true);
+            if (panel2_) esp_lcd_panel_disp_on_off(panel2_, true);
+
+            GetDisplay()->SetPowerSaveMode(false);
+
+            // quay về icon/emotion trước khi ngủ
+            display_left_->SpiLcdDisplay::SetEmotion(last_active_emotion_.c_str());
+
+            // khôi phục ánh sáng & tốc độ mirror
+            set_backlight(brightness_normal_, /*persist=*/false);
+            set_mirror_period_ms(MIRROR_PERIOD_MS);
+
+            // ép refresh nhẹ, đã an toàn (có lock bên trong)
+            reload_and_invalidate_both(); });
+    }
+
+    void enter_screen_off()
+    {
+        screen_off_.store(true);
+        sleeping_.store(true);
+
+        if (panel1_)
+            esp_lcd_panel_disp_on_off(panel1_, false);
+        if (panel2_)
+            esp_lcd_panel_disp_on_off(panel2_, false);
+        set_backlight(0, /*persist=*/false);
+        stop_mirror_timer();
+    }
+
+    //==================== Power Save (3 pha) ====================
+    void init_power_save()
+    {
+        // Không can thiệp clock/audio: cpu_max_freq = -1
+        power_save_timer_ = new PowerSaveTimer(-1, /*sleep_s*/ 60, /*screen_off_s*/ 290);
+
+        // PHA 2: Sleep
+        power_save_timer_->OnEnterSleepMode([this]()
+                                            { enter_sleep(); });
+
+        // Wake (thoát Sleep/ScreenOff)
+        power_save_timer_->OnExitSleepMode([this]()
+                                           { exit_sleep(); });
+
+        // PHA 3: ScreenOff (tắt panel + BL, dừng mirror — vẫn nghe wake word)
+        power_save_timer_->OnShutdownRequest([this]()
+                                             { enter_screen_off(); });
+
+        power_save_timer_->SetEnabled(true);
     }
 
     //==================== Buttons ====================
@@ -547,12 +668,19 @@ private:
     // Backlight
     ledc_channel_config_t bl_ch1_{};
     ledc_channel_config_t bl_ch2_{};
-    uint8_t brightness_ = 85;
+    uint8_t brightness_normal_ = 85;  // độ sáng CHUẨN dùng khi hoạt động bình thường
+    uint8_t brightness_current_ = 85; // độ sáng hiện tại (có thể 0/8% khi sleep/off)
 
     // Timer animate
     esp_timer_handle_t mirror_timer_ = nullptr;
+    bool mirror_timer_started_ = false;
 
+    // PowerSave
     PowerSaveTimer *power_save_timer_ = nullptr;
+    std::atomic<bool> sleeping_{false};
+    std::atomic<bool> screen_off_{false};
+    std::string last_active_emotion_ = "neutral";
+    const char *sleeping_emotion_ = "sleeping";
 };
 
 DECLARE_BOARD(WaveshareS3DualEyeLCD);
